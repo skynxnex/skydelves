@@ -52,6 +52,7 @@ frame:EnableMouse(true)
 frame:SetMovable(true)
 frame:SetClampedToScreen(true)
 frame:SetFrameStrata("HIGH")
+frame:SetToplevel(true)  -- Only needs to be set once at creation
 frame.isMinimized = true
 
 -- Border
@@ -79,17 +80,29 @@ titleBar:SetScript("OnDragStart", function()
 end)
 titleBar:SetScript("OnDragStop", function()
     frame:StopMovingOrSizing()
-    -- Save the new position to DB by converting absolute position to offset
+
+    -- Get absolute position of TOPLEFT corner
     local left = frame:GetLeft()
     local top = frame:GetTop()
 
     if left and top then
-        local screenWidth = UIParent:GetWidth()
-        local screenHeight = UIParent:GetHeight()
+        -- Convert to offset from UIParent TOP center point
+        local uiParentWidth = UIParent:GetWidth()
+        local uiParentHeight = UIParent:GetHeight()
+        local uiParentCenterX = uiParentWidth / 2
+        local uiParentTop = uiParentHeight
 
-        -- Convert absolute position to offset from UIParent TOP center
-        SkyDelvesDB.posX = left - (screenWidth / 2)
-        SkyDelvesDB.posY = top - screenHeight
+        -- Calculate offsets for TOPLEFT anchor relative to UIParent TOP
+        local xOfs = left - uiParentCenterX
+        local yOfs = top - uiParentTop
+
+        -- Save and immediately reapply to ensure consistency
+        SkyDelvesDB.posX = xOfs
+        SkyDelvesDB.posY = yOfs
+
+        -- Force re-anchor to our standard anchor point
+        frame:ClearAllPoints()
+        frame:SetPoint("TOPLEFT", UIParent, "TOP", xOfs, yOfs)
     end
 end)
 
@@ -204,6 +217,11 @@ end)
 closeBtn:SetScript("OnClick", function()
     frame:Hide()
     SkyDelvesDB.isVisible = false
+    -- Stop any pending timer callbacks
+    addon.timersActive = false
+    C_Timer.After(0.1, function()
+        addon.timersActive = true
+    end)
 end)
 
 frame:Hide()
@@ -219,6 +237,8 @@ content:Hide() -- Start hidden (minimized)
 addon.frame = frame
 addon.content = content
 addon.delveEntries = {}
+addon.timersActive = true  -- Flag to prevent timer callbacks after cleanup
+addon.lastPOIUpdate = 0  -- Throttle AREA_POIS_UPDATED events
 
 -- Helper function to set frame size while preserving TOPLEFT anchor
 -- This ensures the frame always grows/shrinks from the top, not center
@@ -230,227 +250,20 @@ function addon:SetFrameSize(width, height)
     self.frame:SetPoint("TOPLEFT", UIParent, "TOP", SkyDelvesDB.posX, SkyDelvesDB.posY)
 end
 
--- Debug function to print ALL quests
-function addon:PrintAllQuests()
-    print("=== ALL QUESTS IN QUEST LOG ===")
-
-    if C_QuestLog and C_QuestLog.GetNumQuestLogEntries then
-        local numQuests = C_QuestLog.GetNumQuestLogEntries()
-        print(string.format("Total quests: %d", numQuests))
-
-        for i = 1, numQuests do
-            local info = C_QuestLog.GetInfo(i)
-            if info then
-                if info.isHeader then
-                    print(string.format("\n[HEADER] %s", info.title or "Unknown"))
-                else
-                    local title = C_QuestLog.GetTitleForQuestID(info.questID) or info.title
-                    print(string.format("  Quest: %s (ID: %d)", title, info.questID))
-
-                    -- Check objectives for delve names
-                    local objectives = C_QuestLog.GetQuestObjectives(info.questID)
-                    if objectives and #objectives > 0 then
-                        for _, obj in ipairs(objectives) do
-                            if obj.text then
-                                print(string.format("    Objective: %s", obj.text))
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    print("=== END QUEST LIST ===")
-end
-
--- Debug function to check for Delve APIs
-function addon:CheckDelveAPIs()
-    print("=== CHECKING FOR DELVE APIs ===")
-
-    -- Check if C_Delves exists
-    if C_Delves then
-        print("C_Delves API EXISTS!")
-        print("Available functions:")
-        for k, v in pairs(C_Delves) do
-            if type(v) == "function" then
-                print("  C_Delves." .. k)
-            end
-        end
-
-        -- Try to get delve info
-        if C_Delves.GetDelves then
-            print("\nCalling C_Delves.GetDelves():")
-            local delves = C_Delves.GetDelves()
-            if delves then
-                for i, delve in ipairs(delves) do
-                    print(string.format("  Delve %d: %s", i, tostring(delve)))
-                end
-            end
-        end
-    else
-        print("C_Delves API NOT FOUND")
-    end
-
-    -- Check C_VignetteInfo for delve vignettes
-    if C_VignetteInfo then
-        print("\nC_VignetteInfo API EXISTS!")
-        if C_VignetteInfo.GetVignettes then
-            local vignettes = C_VignetteInfo.GetVignettes()
-            if vignettes and #vignettes > 0 then
-                print(string.format("Found %d vignettes:", #vignettes))
-                for _, vignetteGUID in ipairs(vignettes) do
-                    local info = C_VignetteInfo.GetVignetteInfo(vignetteGUID)
-                    if info and info.name and info.name:lower():find("delve") then
-                        print(string.format("  Vignette: %s", info.name))
-                        print(string.format("    Atlas: %s", tostring(info.atlasName)))
-                    end
-                end
-            end
-        end
-    else
-        print("C_VignetteInfo API NOT FOUND")
-    end
-
-    print("=== END API CHECK ===")
-end
-
--- Debug function to scan ALL maps for delve POIs
-function addon:ScanAllMapsForDelves()
-    print("=== SCANNING ALL MAPS FOR ALL POIs ===")
-
-    -- Known Midnight map IDs
-    local midnightMaps = {
-        2393, -- Silvermoon City
-        2552, -- Quel'Thalas
-        2601, -- Isle of Quel'Danas
-        2600, -- Voidstorm
-        2651, -- Zul'Aman
-    }
-
-    for _, mapID in ipairs(midnightMaps) do
-        local mapInfo = C_Map.GetMapInfo(mapID)
-        if mapInfo then
-            print(string.format("=== Map: %s (ID: %d) ===", mapInfo.name, mapID))
-
-            if C_AreaPoiInfo and C_AreaPoiInfo.GetAreaPOIForMap then
-                local pois = C_AreaPoiInfo.GetAreaPOIForMap(mapID)
-                if pois and #pois > 0 then
-                    print(string.format("  Found %d POIs:", #pois))
-                    for _, poiID in ipairs(pois) do
-                        local info = C_AreaPoiInfo.GetAreaPOIInfo(mapID, poiID)
-                        if info and info.name then
-                            print(string.format("  POI: %s (ID: %d)", info.name, poiID))
-                            print(string.format("    Atlas: %s", tostring(info.atlasName)))
-                            print(string.format("    Texture: %s", tostring(info.textureIndex)))
-                            print(string.format("    Widget: %s", tostring(info.widgetSetID)))
-                            if info.description and info.description ~= "" then
-                                print(string.format("    Description: %s", info.description))
-                            end
-                        end
-                    end
-                else
-                    print("  No POIs found")
-                end
-            end
-        end
-    end
-
-    print("=== END SCAN ===")
-end
-
--- Debug function to print all available bountiful activities
-function addon:DebugPrintBountifulDelves()
-    print("=== DEBUG: Checking Bountiful Delves ===")
-
-    -- Method 1: C_PerksActivities
-    if C_PerksActivities and C_PerksActivities.GetPerksActivitiesInfo then
-        print("Method 1: C_PerksActivities.GetPerksActivitiesInfo()")
-        local activities = C_PerksActivities.GetPerksActivitiesInfo()
-        if activities and #activities > 0 then
-            for i, activity in ipairs(activities) do
-                print(string.format("  Activity %d: %s", i, tostring(activity.activityName or "nil")))
-            end
-        else
-            print("  No activities found")
-        end
-    else
-        print("Method 1: C_PerksActivities.GetPerksActivitiesInfo NOT AVAILABLE")
-    end
-
-    -- Method 2: Check quest log (ALL quests with "delve")
-    if C_QuestLog and C_QuestLog.GetNumQuestLogEntries then
-        print("Method 2: Quest Log (All delve-related quests)")
-        local found = false
-        for i = 1, C_QuestLog.GetNumQuestLogEntries() do
-            local info = C_QuestLog.GetInfo(i)
-            if info and not info.isHeader and info.questID then
-                local title = C_QuestLog.GetTitleForQuestID(info.questID)
-                if title and title:lower():find("delve") then
-                    print(string.format("  Quest: %s (ID: %d)", title, info.questID))
-                    found = true
-                end
-            end
-        end
-        if not found then
-            print("  No delve quests found")
-        end
-    else
-        print("Method 2: C_QuestLog NOT AVAILABLE")
-    end
-
-    -- Method 3: Check World Map POIs
-    if C_AreaPoiInfo and C_AreaPoiInfo.GetAreaPOISecondsLeft then
-        print("Method 3: World Map POIs")
-        local mapID = C_Map.GetBestMapForUnit("player")
-        if mapID then
-            print("  Current Map ID:", mapID)
-            local pois = C_AreaPoiInfo.GetAreaPOIForMap(mapID)
-            if pois and #pois > 0 then
-                for _, poiID in ipairs(pois) do
-                    local info = C_AreaPoiInfo.GetAreaPOIInfo(mapID, poiID)
-                    if info and info.name then
-                        print(string.format("  POI: %s (ID: %d)", info.name, poiID))
-                    end
-                end
-            else
-                print("  No POIs found on current map")
-            end
-        else
-            print("  No map ID found")
-        end
-    else
-        print("Method 3: C_AreaPoiInfo NOT AVAILABLE")
-    end
-
-    -- Method 4: Weekly Rewards
-    if C_WeeklyRewards and C_WeeklyRewards.GetActivities then
-        print("Method 4: Weekly Rewards Activities")
-        local activities = C_WeeklyRewards.GetActivities()
-        if activities and #activities > 0 then
-            for i, activity in ipairs(activities) do
-                if activity then
-                    print(string.format("  Activity %d: type=%s, level=%s", i, tostring(activity.type), tostring(activity.level)))
-                end
-            end
-        else
-            print("  No weekly activities found")
-        end
-    else
-        print("Method 4: C_WeeklyRewards NOT AVAILABLE")
-    end
-
-    print("=== END DEBUG ===")
-end
+-- Debug functions - only loaded when DEBUG mode is enabled via /sd debug
+-- These are kept for development/troubleshooting but not loaded in production
 
 -- Function to check if a delve is bountiful (using atlasName)
-function addon:IsDelveBoumtiful(delve)
+function addon:IsDelveBountiful(delve)
     -- Check if the delve's POI has atlasName "delves-bountiful"
-    if C_AreaPoiInfo and delve.poiID and delve.mapID then
-        local poiInfo = C_AreaPoiInfo.GetAreaPOIInfo(delve.mapID, delve.poiID)
-        if poiInfo and poiInfo.atlasName == "delves-bountiful" then
-            return true
-        end
+    if not (C_AreaPoiInfo and delve.poiID and delve.mapID) then
+        return false
+    end
+
+    -- Protected call in case API changes or fails
+    local success, poiInfo = pcall(C_AreaPoiInfo.GetAreaPOIInfo, delve.mapID, delve.poiID)
+    if success and poiInfo and poiInfo.atlasName == "delves-bountiful" then
+        return true
     end
     return false
 end
@@ -470,7 +283,7 @@ function addon:UpdateDelveList()
 
     -- Filter to only bountiful delves
     for i, delve in ipairs(DELVES) do
-        local isBountiful = self:IsDelveBoumtiful(delve)
+        local isBountiful = self:IsDelveBountiful(delve)
 
         if isBountiful then
             if not self.delveEntries[displayIndex] then
@@ -543,22 +356,17 @@ SLASH_SKYDELVES2 = "/sd"
 SlashCmdList["SKYDELVES"] = function(msg)
     msg = msg:lower():trim()
 
-    if msg == "debug" then
-        addon:DebugPrintBountifulDelves()
-    elseif msg == "scan" then
-        addon:ScanAllMapsForDelves()
-    elseif msg == "api" then
-        addon:CheckDelveAPIs()
-    elseif msg == "quests" then
-        addon:PrintAllQuests()
-    elseif addon.frame:IsShown() then
+    if addon.frame:IsShown() then
         addon.frame:Hide()
         SkyDelvesDB.isVisible = false
+        -- Stop any pending timer callbacks
+        addon.timersActive = false
+        C_Timer.After(0.1, function()
+            addon.timersActive = true
+        end)
     else
         addon:UpdateDelveList()
         addon.frame:Show()
-        addon.frame:SetFrameStrata("DIALOG")
-        addon.frame:SetToplevel(true)
         SkyDelvesDB.isVisible = true
         -- Auto-expand when opened
         if addon.frame.isMinimized then
@@ -589,38 +397,45 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Auto-open window if it was visible last session
         if SkyDelvesDB.isVisible then
             C_Timer.After(1, function()
-                addon:UpdateDelveList()
-                addon.frame:Show()
-                addon.frame:SetFrameStrata("DIALOG")
-                addon.frame:SetToplevel(true)
-                -- Expand on load
-                if addon.frame.isMinimized then
-                    addon.frame.minMaxBtn.text:SetText("-")
-                    addon.frame.isMinimized = false
-                    addon.content:Show()
+                if addon.timersActive then
+                    addon:UpdateDelveList()
+                    addon.frame:Show()
+                    -- Expand on load
+                    if addon.frame.isMinimized then
+                        addon.frame.minMaxBtn.text:SetText("-")
+                        addon.frame.isMinimized = false
+                        addon.content:Show()
+                    end
                 end
             end)
         end
     elseif event == "QUEST_TURNED_IN" then
         -- Quest completed, update delve list after short delay
         C_Timer.After(2, function()
-            if addon.frame:IsShown() then
+            if addon.timersActive and addon.frame:IsShown() then
                 addon:UpdateDelveList()
             end
         end)
     elseif event == "SCENARIO_COMPLETED" then
         -- Delve completed, update list
         C_Timer.After(2, function()
-            if addon.frame:IsShown() then
+            if addon.timersActive and addon.frame:IsShown() then
                 addon:UpdateDelveList()
             end
         end)
     elseif event == "AREA_POIS_UPDATED" then
         -- POIs updated (weekly reset etc), refresh list
-        if addon.frame:IsShown() then
-            C_Timer.After(1, function()
-                addon:UpdateDelveList()
-            end)
+        -- Throttle this event to max once per 5 seconds to prevent spam
+        local currentTime = GetTime()
+        if currentTime - addon.lastPOIUpdate >= 5 then
+            addon.lastPOIUpdate = currentTime
+            if addon.frame:IsShown() then
+                C_Timer.After(1, function()
+                    if addon.timersActive then
+                        addon:UpdateDelveList()
+                    end
+                end)
+            end
         end
     end
 end)
