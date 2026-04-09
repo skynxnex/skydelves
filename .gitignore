@@ -1,0 +1,4 @@
+# WoW saved variables (user-specific)
+*.bak
+*.lua~
+*.toc~
