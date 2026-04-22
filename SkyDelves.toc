@@ -1,8 +1,8 @@
-## Interface: 120001
+## Interface: 120005
 ## Title: Sky Delves
 ## Notes: Shows which delves are bountiful and their locations
 ## Author: pontu
-## Version: 1.1.0
+## Version: 1.1.1
 ## SavedVariables: SkyDelvesDB
 
 SkyDelves.lua
