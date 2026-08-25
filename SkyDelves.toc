@@ -2,7 +2,7 @@
 ## Title: Sky Delves
 ## Notes: Shows which delves are bountiful and their locations
 ## Author: pontu
-## Version: 1.1.1
+## Version: 1.2.1
 ## SavedVariables: SkyDelvesDB
 
 SkyDelves.lua

@@ -5,6 +5,7 @@ A World of Warcraft addon that tracks and displays bountiful delves for Midnight
 ## Features
 
 - Shows only bountiful delves currently available
+- Delves are discovered from the map API, so new zones and delves are picked up automatically
 - Compact, sleek UI with minimize/maximize
 - Lock/unlock frame movement
 - Auto-updates when completing delves
@@ -20,6 +21,7 @@ A World of Warcraft addon that tracks and displays bountiful delves for Midnight
 ## Usage
 
 - `/sd` or `/skydelves` - Toggle window
+- `/sd scan` - Print every delve POI the API reports, with map and atlas name (diagnostics)
 - Click `-` to minimize, `+` to maximize
 - Click `L`/`U` to lock/unlock frame movement
 - Click `×` to close window
