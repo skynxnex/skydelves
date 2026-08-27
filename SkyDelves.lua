@@ -251,9 +251,8 @@ function addon:SetFrameSize(width, height)
     self.frame:SetSize(width, height)
 end
 
--- How deep a map sits in the map hierarchy. Used to prefer the most specific
--- map reporting a delve, so a delve is labelled "Isle of Quel'Danas" rather
--- than the broader "Quel'Thalas" map that also carries a POI for it.
+-- How deep a map sits in the map hierarchy. A delve is reported on several
+-- maps, including its own; the shallowest one is the zone it sits in.
 local function GetMapDepth(mapID)
     local depth = 0
     local currentID = mapID
@@ -268,7 +267,7 @@ local function GetMapDepth(mapID)
     return depth
 end
 
--- Build the list of maps to scan, most specific map first.
+-- Build the list of maps to scan, broadest map first.
 local zoneCache
 function addon:GetDelveZones()
     if zoneCache then
@@ -302,14 +301,16 @@ function addon:GetDelveZones()
     -- second POI for the same delve under a different poiID, which would show
     -- up as a duplicate labelled with the continent name.
 
-    -- Deepest map first, so the most specific zone name wins on a duplicate
+    -- Shallowest map first, so zones are scanned before the delve maps nested
+    -- inside them. Only affects readability of /sd scan; the zone actually
+    -- picked for a delve is decided by IsBetterZone below.
     local depths = {}
     for _, mapID in ipairs(zones) do
         depths[mapID] = GetMapDepth(mapID)
     end
     table.sort(zones, function(a, b)
         if depths[a] ~= depths[b] then
-            return depths[a] > depths[b]
+            return depths[a] < depths[b]
         end
         return a < b
     end)
@@ -321,27 +322,77 @@ function addon:GetDelveZones()
     return zones
 end
 
--- Collect every POI id the API reports for a map (delve list + generic POI list)
-local function CollectMapPOIs(mapID, out)
+-- Collect every POI the API reports for a map, recording which of the two
+-- lists it came from. A POI that only shows up in the generic area POI list
+-- may just be spilling over from a neighbouring map.
+local function CollectMapPOIs(mapID)
+    local out, index = {}, {}
+
+    local function record(poiID, source)
+        local entry = index[poiID]
+        if entry then
+            entry.source = entry.source .. "+" .. source
+        else
+            entry = {poiID = poiID, source = source}
+            index[poiID] = entry
+            out[#out + 1] = entry
+        end
+    end
+
     local success, ids = pcall(C_AreaPoiInfo.GetDelvesForMap, mapID)
     if success and ids then
         for _, poiID in ipairs(ids) do
-            out[#out + 1] = poiID
+            record(poiID, "delve")
         end
     end
 
     success, ids = pcall(C_AreaPoiInfo.GetAreaPOIForMap, mapID)
     if success and ids then
         for _, poiID in ipairs(ids) do
-            out[#out + 1] = poiID
+            record(poiID, "areapoi")
         end
     end
+
+    return out
 end
 
 -- A POI is a bountiful delve when its atlas is the bountiful delve icon.
 -- Matched as a substring so icon renames like "delves-bountiful-2" still work.
 local function IsBountifulAtlas(atlasName)
     return atlasName ~= nil and string.find(string.lower(atlasName), "bountiful", 1, true) ~= nil
+end
+
+-- How far inside a map a POI sits, as the distance to the nearest map edge.
+local function GetInset(position)
+    if not position then
+        return 0
+    end
+    local x, y = position:GetXY()
+    if not (x and y) then
+        return 0
+    end
+    return math.min(x, 1 - x, y, 1 - y)
+end
+
+-- Of the maps reporting the same delve, which one locates it best.
+--
+-- GetDelvesForMap also returns delves from neighbouring zones, so a delve is
+-- typically reported on two or three maps and neither map depth nor the API
+-- source distinguishes them. What does: a delve spilling over onto a
+-- neighbouring map lands near that map's border, while the map it belongs to
+-- places it well inside. The Shadow Enclave sits at 45/86 on Eversong Woods
+-- but 5/59 on Zul'Aman, and Atal'Aman the other way round at 64/80 on
+-- Eversong Woods and 25/53 on Zul'Aman.
+--
+-- The delve's own map, recognised by sharing its name, always loses.
+local function IsBetterZone(candidate, current)
+    if candidate.selfNamed ~= current.selfNamed then
+        return current.selfNamed
+    end
+    if candidate.inset ~= current.inset then
+        return candidate.inset > current.inset
+    end
+    return candidate.mapID < current.mapID
 end
 
 -- Scan all delve zones and return the bountiful delves that are currently up
@@ -351,35 +402,38 @@ function addon:GetBountifulDelves()
         return results
     end
 
-    -- The same delve is reported on several maps under different poiIDs, so
-    -- dedupe on the delve name as well as the POI id
-    local seenPOI, seenName = {}, {}
+    -- The same delve is reported on several maps, under a different poiID on
+    -- each, so collapse them by name and keep the best-named location
+    local byName = {}
     for _, mapID in ipairs(self:GetDelveZones()) do
         local mapInfo = C_Map.GetMapInfo(mapID)
         local zoneName = mapInfo and mapInfo.name or ("Map " .. mapID)
 
-        local poiIDs = {}
-        CollectMapPOIs(mapID, poiIDs)
+        for _, poi in ipairs(CollectMapPOIs(mapID)) do
+            local poiID = poi.poiID
+            local success, poiInfo = pcall(C_AreaPoiInfo.GetAreaPOIInfo, mapID, poiID)
+            if success and poiInfo and IsBountifulAtlas(poiInfo.atlasName) then
+                local name = poiInfo.name or ("POI " .. poiID)
+                local nameKey = string.lower(name)
+                local candidate = {
+                    poiID = poiID,
+                    mapID = mapID,
+                    name = name,
+                    zone = zoneName,
+                    inset = GetInset(poiInfo.position),
+                    selfNamed = string.lower(zoneName) == nameKey,
+                }
 
-        for _, poiID in ipairs(poiIDs) do
-            if not seenPOI[poiID] then
-                seenPOI[poiID] = true
-                local success, poiInfo = pcall(C_AreaPoiInfo.GetAreaPOIInfo, mapID, poiID)
-                if success and poiInfo and IsBountifulAtlas(poiInfo.atlasName) then
-                    local name = poiInfo.name or ("POI " .. poiID)
-                    local nameKey = string.lower(name)
-                    if not seenName[nameKey] then
-                        seenName[nameKey] = true
-                        results[#results + 1] = {
-                            poiID = poiID,
-                            mapID = mapID,
-                            name = name,
-                            zone = zoneName,
-                        }
-                    end
+                local current = byName[nameKey]
+                if not current or IsBetterZone(candidate, current) then
+                    byName[nameKey] = candidate
                 end
             end
         end
+    end
+
+    for _, delve in pairs(byName) do
+        results[#results + 1] = delve
     end
 
     table.sort(results, function(a, b)
@@ -482,14 +536,19 @@ SlashCmdList["SKYDELVES"] = function(msg)
         local found = 0
         for _, mapID in ipairs(addon:GetDelveZones()) do
             local mapInfo = C_Map.GetMapInfo(mapID)
-            local poiIDs = {}
-            CollectMapPOIs(mapID, poiIDs)
-            for _, poiID in ipairs(poiIDs) do
+            for _, poi in ipairs(CollectMapPOIs(mapID)) do
+                local poiID = poi.poiID
                 local success, poiInfo = pcall(C_AreaPoiInfo.GetAreaPOIInfo, mapID, poiID)
                 if success and poiInfo and poiInfo.atlasName and string.find(poiInfo.atlasName, "delve", 1, true) then
                     found = found + 1
-                    print(string.format("  [%d] %s - %s (poi %d, atlas %s)%s",
-                        mapID, mapInfo and mapInfo.name or "?", poiInfo.name or "?", poiID,
+                    local x, y = 0, 0
+                    if poiInfo.position then
+                        x, y = poiInfo.position:GetXY()
+                    end
+                    print(string.format("  [%d d%d] %s - %s (poi %d, %s, %.1f/%.1f, inset %.3f, %s)%s",
+                        mapID, GetMapDepth(mapID), mapInfo and mapInfo.name or "?",
+                        poiInfo.name or "?", poiID, poi.source, x * 100, y * 100,
+                        GetInset(poiInfo.position),
                         poiInfo.atlasName, IsBountifulAtlas(poiInfo.atlasName) and " |cFFFFD100BOUNTIFUL|r" or ""))
                 end
             end
