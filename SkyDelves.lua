@@ -2,22 +2,45 @@
 local addonName, addon = ...
 addon = addon or {}  -- Make sure addon table exists
 
--- Initialize saved variables
-if not SkyDelvesDB then
-    SkyDelvesDB = {
+-- Initialize saved variables with defaults and validate position
+local function InitDB()
+    local defaults = {
         locked = false,
         posX = -140,
         posY = -100,
-        isVisible = true
+        isVisible = true,
+        autoHide = { raid = false, delve = false, dungeon = false }
     }
+
+    -- fill in any missing keys
+    for k, v in pairs(defaults) do
+        if SkyDelvesDB[k] == nil then
+            SkyDelvesDB[k] = v
+        end
+    end
+
+    -- nested table for autoHide requires per-key fill
+    if type(SkyDelvesDB.autoHide) == "table" then
+        for k, v in pairs(defaults.autoHide) do
+            if SkyDelvesDB.autoHide[k] == nil then
+                SkyDelvesDB.autoHide[k] = v
+            end
+        end
+    end
+
+    -- validate saved position is reasonable
+    if not SkyDelvesDB.posX or not SkyDelvesDB.posY or
+       math.abs(SkyDelvesDB.posX) > 2000 or math.abs(SkyDelvesDB.posY) > 2000 then
+        SkyDelvesDB.posX = -140
+        SkyDelvesDB.posY = -100
+    end
 end
 
--- Validate saved position is reasonable
-if not SkyDelvesDB.posX or not SkyDelvesDB.posY or
-   math.abs(SkyDelvesDB.posX) > 2000 or math.abs(SkyDelvesDB.posY) > 2000 then
-    SkyDelvesDB.posX = -140
-    SkyDelvesDB.posY = -100
+-- create table if needed and apply defaults (will be replaced by saved vars)
+if not SkyDelvesDB then
+    SkyDelvesDB = {}
 end
+InitDB()
 
 -- Delves are discovered from the map API instead of a hardcoded POI list, so
 -- new zones and new delves (e.g. The Coiled Isle in 12.1) show up automatically.
@@ -41,6 +64,13 @@ local KNOWN_DELVE_ZONES = {
     2512, -- The Coiled Isle
 }
 
+-- Rules for contextual auto-hide
+local AUTOHIDE_RULES = {
+    { key = "raid",    label = "raid" },
+    { key = "delve",   label = "delve" },
+    { key = "dungeon", label = "dungeon" },
+}
+
 -- Frame creation - Sleek minimal design
 local frame = CreateFrame("Frame", "SkyDelvesFrame", UIParent)
 frame:SetSize(280, 32) -- Start minimized
@@ -48,8 +78,7 @@ frame:SetPoint("TOPLEFT", UIParent, "TOP", SkyDelvesDB.posX, SkyDelvesDB.posY)
 frame:EnableMouse(true)
 frame:SetMovable(true)
 frame:SetClampedToScreen(true)
-frame:SetFrameStrata("HIGH")
-frame:SetToplevel(true)  -- Only needs to be set once at creation
+frame:SetFrameStrata("MEDIUM")  -- keep below blizzard UI panels
 frame.isMinimized = true
 
 -- Ensure position stays locked when size changes
@@ -249,6 +278,74 @@ addon.lastPOIUpdate = 0  -- Throttle AREA_POIS_UPDATED events
 function addon:SetFrameSize(width, height)
     -- Just resize - OnSizeChanged callback will handle re-anchoring
     self.frame:SetSize(width, height)
+end
+
+-- Instance context detection
+local function GetInstanceContext()
+    if not GetInstanceInfo then return nil, nil end
+    local ok, _, instanceType, difficultyID = pcall(GetInstanceInfo)
+    if not ok then return nil, nil end
+    return instanceType, difficultyID
+end
+
+-- Delve detection - difficultyID 208 is the Delve difficulty
+local function IsInDelve()
+    local instanceType, difficultyID = GetInstanceContext()
+    if difficultyID == 208 then return true end
+    if C_PartyInfo and C_PartyInfo.IsDelveInProgress then
+        local ok, inDelve = pcall(C_PartyInfo.IsDelveInProgress)
+        if ok and inDelve then return true end
+    end
+    return false
+end
+
+-- Check if any auto-hide rule should hide the frame
+function addon.ShouldAutoHide()
+    if not SkyDelvesDB.autoHide then return false end
+
+    -- Early exit if no rules enabled
+    local anyEnabled = false
+    for k, v in pairs(SkyDelvesDB.autoHide) do
+        if v then
+            anyEnabled = true
+            break
+        end
+    end
+    if not anyEnabled then return false end
+
+    local instanceType, difficultyID = GetInstanceContext()
+
+    if SkyDelvesDB.autoHide.delve and IsInDelve() then
+        return true
+    end
+
+    if SkyDelvesDB.autoHide.dungeon and instanceType == "party" and not IsInDelve() then
+        return true
+    end
+
+    if SkyDelvesDB.autoHide.raid and instanceType == "raid" then
+        return true
+    end
+
+    return false
+end
+
+-- Apply visibility based on auto-hide rules and user preference
+function addon.ApplyVisibility()
+    if addon.ShouldAutoHide() then
+        if addon.frame:IsShown() then
+            addon.frame:Hide()
+            addon.autoHidden = true
+        end
+    else
+        if addon.autoHidden then
+            addon.autoHidden = nil
+            if SkyDelvesDB.isVisible then
+                addon:UpdateDelveList()
+                addon.frame:Show()
+            end
+        end
+    end
 end
 
 -- How deep a map sits in the map hierarchy. A delve is reported on several
@@ -557,6 +654,57 @@ SlashCmdList["SKYDELVES"] = function(msg)
         return
     end
 
+    -- Auto-hide configuration
+    if msg:match("^autohide") then
+        local args = {}
+        for word in msg:gmatch("%S+") do
+            args[#args + 1] = word
+        end
+
+        if #args == 1 then
+            -- Show current settings
+            print("|cFF00FFFFSkyDelves|r auto-hide settings:")
+            for _, rule in ipairs(AUTOHIDE_RULES) do
+                local status = SkyDelvesDB.autoHide[rule.key] and "|cFF00FF00ON|r" or "|cFFFF0000OFF|r"
+                print("  " .. rule.label .. ": " .. status)
+            end
+            return
+        elseif #args == 3 then
+            local ruleName = args[2]
+            local value = args[3]
+
+            -- Find matching rule
+            local ruleKey = nil
+            for _, rule in ipairs(AUTOHIDE_RULES) do
+                if rule.label == ruleName then
+                    ruleKey = rule.key
+                    break
+                end
+            end
+
+            if not ruleKey then
+                print("|cFF00FFFFSkyDelves|r unknown rule. Valid options: raid, delve, dungeon")
+                return
+            end
+
+            if value == "on" then
+                SkyDelvesDB.autoHide[ruleKey] = true
+                print("|cFF00FFFFSkyDelves|r auto-hide in " .. ruleName .. " |cFF00FF00enabled|r")
+                addon.ApplyVisibility()
+            elseif value == "off" then
+                SkyDelvesDB.autoHide[ruleKey] = false
+                print("|cFF00FFFFSkyDelves|r auto-hide in " .. ruleName .. " |cFFFF0000disabled|r")
+                addon.ApplyVisibility()
+            else
+                print("|cFF00FFFFSkyDelves|r invalid value. Use 'on' or 'off'")
+            end
+            return
+        else
+            print("|cFF00FFFFSkyDelves|r usage: /sd autohide [raid|delve|dungeon] [on|off]")
+            return
+        end
+    end
+
     if addon.frame:IsShown() then
         addon.frame:Hide()
         SkyDelvesDB.isVisible = false
@@ -580,12 +728,34 @@ end
 
 -- Event handler
 local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("QUEST_TURNED_IN")
 eventFrame:RegisterEvent("SCENARIO_COMPLETED")
 eventFrame:RegisterEvent("AREA_POIS_UPDATED")
+eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+eventFrame:RegisterEvent("PLAYER_DIFFICULTY_CHANGED")
+eventFrame:RegisterEvent("SCENARIO_UPDATE")
 eventFrame:SetScript("OnEvent", function(self, event, ...)
-    if event == "PLAYER_ENTERING_WORLD" then
+    if event == "ADDON_LOADED" then
+        local loadedAddon = ...
+        if loadedAddon == addonName then
+            -- saved variables now loaded, apply defaults and refresh UI
+            if not SkyDelvesDB then
+                SkyDelvesDB = {}
+            end
+            InitDB()
+
+            -- re-apply saved position
+            frame:ClearAllPoints()
+            frame:SetPoint("TOPLEFT", UIParent, "TOP", SkyDelvesDB.posX, SkyDelvesDB.posY)
+
+            -- refresh lock button caption
+            addon.frame.lockBtn.text:SetText(SkyDelvesDB.locked and "L" or "U")
+
+            self:UnregisterEvent("ADDON_LOADED")
+        end
+    elseif event == "PLAYER_ENTERING_WORLD" then
         local playerLevel = UnitLevel("player")
         local maxLevel = GetMaxLevelForPlayerExpansion()
 
@@ -598,7 +768,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Auto-open window if it was visible last session
         if SkyDelvesDB.isVisible then
             C_Timer.After(1, function()
-                if addon.timersActive then
+                if addon.timersActive and not addon.ShouldAutoHide() then
                     addon:UpdateDelveList()
                     addon.frame:Show()
                     -- Expand on load
@@ -610,6 +780,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
                 end
             end)
         end
+        addon.ApplyVisibility()
     elseif event == "QUEST_TURNED_IN" then
         -- Quest completed, update delve list after short delay
         C_Timer.After(2, function()
@@ -638,6 +809,12 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
                 end)
             end
         end
+    elseif event == "ZONE_CHANGED_NEW_AREA" then
+        addon.ApplyVisibility()
+    elseif event == "PLAYER_DIFFICULTY_CHANGED" then
+        addon.ApplyVisibility()
+    elseif event == "SCENARIO_UPDATE" then
+        addon.ApplyVisibility()
     end
 end)
 
